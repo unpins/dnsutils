@@ -46,44 +46,57 @@
       inherit self;
       name = "dnsutils";
       binName = "dnsutils";
+      pkgsAttr = "bind";
       smoke = [ "--unpin-program=dig" "-v" ];
       smokePattern = "DiG 9\\.";
+
+      # Build via the unpin-llvm engine + emit a bitcode multicall module. On
+      # Linux the engine compiles the force-static bind (guard neutered;
+      # gssapi/dnstap/libxml2 dropped; libedit+embedded-ncurses for line editing)
+      # to bitcode, letting make link dig/host/nslookup/delv/nsupdate as the five
+      # separate binaries upstream builds by default — the engine captures each
+      # link sidecar and the standalone self-folds them into one `dnsutils`
+      # binary. darwin/windows keep the cpp-rename fold in ./multicall.nix (which
+      # needs the throwaway-link-avoiding `.o`-only buildPhase; that build is
+      # incompatible with the engine's per-program link capture, so the engine
+      # path uses bind's normal build+install instead). Pure C — no requires.cxx.
+      engine = "unpin-llvm";
+      multicall = {
+        programs = [
+          { name = "dig"; }
+          { name = "host"; }
+          { name = "nslookup"; }
+          { name = "delv"; }
+          { name = "nsupdate"; }
+        ];
+        defaultProgram = "dig";
+      };
+
       build = pkgs:
         let
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-          # Retarget openssl's OPENSSLDIR/ENGINESDIR/MODULESDIR off /nix/store to
-          # the conventional /etc/ssl (same fix, and rationale, as the `openssl`
-          # package): kills the store-path strings the static libcrypto bakes in,
-          # and makes dig's TLS consult the host trust store. libxml2 is only for
-          # named's XML statistics channel — the client tools don't use it — so
-          # drop it to shed its /etc/xml/catalog reference.
-          opensslRetargeted = pkgs.pkgsStatic.openssl.overrideAttrs (o: {
-            buildFlags = (o.buildFlags or [ ]) ++ [
-              "OPENSSLDIR=/etc/ssl"
-              "ENGINESDIR=/etc/ssl/engines-3"
-              "MODULESDIR=/etc/ssl/ossl-modules"
-            ];
-          });
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
+          # openssl is retargeted (OPENSSLDIR/ENGINESDIR/MODULESDIR off /nix/store
+          # to /etc/ssl, so static libcrypto bakes no store paths and dig's TLS
+          # consults the host trust store) by nix-lib's native-overlay/openssl.nix —
+          # the same lib.retargetOpenssl recipe the standalone `openssl` package
+          # uses — so pkgs.pkgsStatic.openssl is already that one shared, deduped
+          # copy: no per-package override here (same arrangement as ncurses below).
+          # libxml2 is only for named's XML statistics channel — the client tools
+          # don't use it — so it's dropped below to shed its /etc/xml/catalog ref.
           # Line-editing for nslookup/nsupdate's interactive prompts. bind detects
           # it via pkg-config; `--with-readline=libedit` (below) makes it the BSD
           # libedit (lighter than GNU readline and avoids pulling GPL into the
-          # binary). libedit needs ncurses for terminfo, whose static build bakes
-          # an absolute /nix/store terminfo path — so feed it the embedded-fallback
-          # ncurses to stay 0-ref.
-          #
-          # `…Only` (not plain `embedFallbackTerminfo`) is required here: libedit
-          # uses the *terminfo* API (setupterm/tigetstr), which pulls ncurses' DB
-          # reader object — and with database lookup still enabled that object
-          # carries the `$out/share/terminfo` store-path string (telnet escapes it
-          # only because it uses the termcap API, which doesn't pull that object).
-          # `…Only` adds `--disable-database`, so ncurses uses only the ~35
-          # compiled-in fallback terminals (xterm/256color/vt100/tmux/screen/
-          # alacritty/kitty/… — every real terminal) and bakes no path. Same
-          # variant psmisc and the Windows targets use.
-          embeddedNcurses = lib.embedFallbackTerminfoOnly pkgs.pkgsStatic.ncurses;
+          # binary). libedit uses the *terminfo* API (setupterm/tigetstr), which
+          # pulls ncurses' DB-reader object. native-overlay/ncurses.nix bakes the
+          # FHS default-dir pin (so the binary stays 0-ref with the database on,
+          # same as htop) + the ~35 compiled-in fallbacks into every engine
+          # ncurses, linux + darwin, so pkgsStatic.ncurses is already that one
+          # shared, deduped copy — no per-package override.
+          embeddedNcurses = pkgs.pkgsStatic.ncurses;
           libeditStatic = pkgs.pkgsStatic.libedit.override { ncurses = embeddedNcurses; };
-          bindStatic = (pkgs.pkgsStatic.bind.override {
-            openssl = opensslRetargeted;
+          bindStatic = (pkgs.pkgsStatic.bind.override ({
+            openssl = pkgs.pkgsStatic.openssl;
             libxml2 = null;
             # GSS-TSIG (gssapi/krb5) can't static-link into bind — the catalog
             # has always dropped it for dnsutils. `enableGSSAPI = false` removes
@@ -101,7 +114,16 @@
             # darwin and trims an unused chunk of the closure on every platform.
             fstrm = null;
             protobufc = null;
-          }).overrideAttrs (old: {
+          } // pkgs.lib.optionalAttrs isLinux {
+            # Engine (Linux) path: jemalloc's static lib pulls `-lstdc++` (its
+            # C++ bits) via jemalloc.pc, and the engine toolchain ships libc++
+            # (not GNU libstdc++) — so bind's tool links fail with "unable to
+            # find library -lstdc++". The fold path (darwin/windows) relinks by
+            # hand and absorbs it; the engine link goes through bind's own
+            # libtool line, so drop jemalloc here and let the five short-lived
+            # client tools use the default musl allocator (no C++ dep → pure C).
+            jemalloc = null;
+          })).overrideAttrs (old: ({
             # libedit isn't a bind.override parameter, so add it (with the
             # embedded-terminfo ncurses) as a build input; pkg-config then finds
             # libedit.pc and `--with-readline=libedit` wires it into nslookup/
@@ -131,7 +153,22 @@
               # where the flag keeps its standard "build the .a archive" meaning,
               # and the multicall fold *needs* static-only archives — so opt back
               # in with the equivalent spellings the filter doesn't match.
-              ++ pkgs.lib.optionals isDarwin [ "--enable-static=yes" "--enable-shared=no" ];
+              ++ pkgs.lib.optionals isDarwin [ "--enable-static=yes" "--enable-shared=no" ]
+              # Engine (Linux) path: bind's normal build+install links the five
+              # client tools as separate static binaries (musl pkgsStatic), and
+              # the engine captures each link. The catalog's filterEnableStatic
+              # strip only fires on darwin, so on Linux the pkgsStatic-injected
+              # --enable-static/--disable-shared already stand — no opt-back-in
+              # needed. We DON'T build named/the server tools (they'd add applets
+              # we don't ship); the bin/ subset is selected by the program list.
+              ;
+          }
+          # The fold-only build/install (`.o`-only buildPhase, single `out`
+          # output) is for the darwin/windows cpp-rename path. The engine (Linux)
+          # path uses bind's NORMAL build+install so make links the five client
+          # tools as separate binaries for the engine to capture — so skip these
+          # overrides on Linux.
+          // pkgs.lib.optionalAttrs (!isLinux) {
             # Build only what the five client tools need. `bind.keys.h` is a
             # top-level perl-generated BUILT_SOURCE — it must exist before the
             # bin dirs compile (delv.c includes it) — then lib/, then *only the
@@ -172,8 +209,48 @@
             meta = (old.meta or { }) // { outputsToInstall = [ "out" ]; };
             dontPatchELF = true;
             separateDebugInfo = false;
-          });
+          }
+          # Engine (Linux) path: build + LINK only the five client tools (lib/ +
+          # the three client bin dirs), never named/the server tools — named
+          # links C++ (`-lstdc++`, unavailable unprefixed under the engine) and
+          # would add applets we don't ship. Unlike the fold path we DO let make
+          # link each tool: that real link is what the engine captures per
+          # program for the bitcode self-fold. Install just the five binaries +
+          # their man pages into the single `out`.
+          // pkgs.lib.optionalAttrs isLinux {
+            outputs = [ "out" ];
+            meta = (old.meta or { }) // { outputsToInstall = [ "out" ]; };
+            buildPhase = ''
+              runHook preBuild
+              make bind.keys.h
+              # pkglibdir retarget: same 0-ref rationale as the fold path — libns
+              # bakes -DNAMED_PLUGINDIR=$(pkglibdir) into hooks.c (delv links
+              # libns), so point it at a conventional system path, not $out.
+              make -C lib -j$NIX_BUILD_CORES pkglibdir=/usr/lib/bind
+              make -C bin/dig -j$NIX_BUILD_CORES dig host nslookup
+              make -C bin/delv -j$NIX_BUILD_CORES delv
+              make -C bin/nsupdate -j$NIX_BUILD_CORES nsupdate
+              make -C doc/man -j$NIX_BUILD_CORES dig.1 host.1 nslookup.1 delv.1 nsupdate.1
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin" "$out/share/man/man1"
+              for t in bin/dig/dig bin/dig/host bin/dig/nslookup \
+                       bin/delv/delv bin/nsupdate/nsupdate; do
+                install -m755 "$t" "$out/bin/$(basename "$t")"
+              done
+              for m in dig host nslookup delv nsupdate; do
+                install -m644 "doc/man/$m.1" "$out/share/man/man1/$m.1"
+              done
+              runHook postInstall
+            '';
+            dontPatchELF = true;
+            separateDebugInfo = false;
+          }));
         in
-        import ./multicall.nix { inherit lib; } { inherit pkgs; basePkg = bindStatic; };
+        if isLinux
+        then bindStatic
+        else import ./multicall.nix { inherit lib; } { inherit pkgs; basePkg = bindStatic; };
     };
 }
