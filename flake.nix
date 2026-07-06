@@ -9,36 +9,29 @@
   inputs.unpins-lib.url = "github:unpins/nix-lib";
 
   # The DNS client tools from ISC BIND 9 — what Debian ships as bind9-dnsutils:
-  # dig, host, nslookup, delv and nsupdate. We fold them into one multicall
-  # binary (see multicall.nix); bin/dnsutils is the real ELF and each tool name
-  # is an argv[0] alias symlink.
+  # dig, host, nslookup, delv and nsupdate. The unpin-llvm engine compiles each
+  # with -flto and captures its link into a per-program bitcode module; the
+  # standalone then self-folds the five into one `dnsutils`, where each tool name
+  # is an argv[0] alias. Identical mechanism on Linux and darwin — darwin used to
+  # hand-fold via a cpp-rename ./multicall.nix, retired now that the engine
+  # self-fold works on macOS too (useEngine is forced on for darwin).
   #
   # Force-static base build: `pkgsStatic.bind` refuses to configure — bind's
   # configure aborts with "Static linking is not supported as it disables
   # dlopen() and certain security features". The dnsutils tools use none of the
   # dlopen-loaded machinery (that's named's dyndb/plugins/dnstap), so the guard
-  # is overly broad for our subset. We neuter it, drop the bits that genuinely
-  # can't static-link (krb5/gssapi, dnstap), and build only lib/ + the three
-  # client bin dirs with a libtool `-all-static` link. Without that explicit
-  # flag the executables come out dynamic even though the bind libs are static;
-  # the guard bypass only makes the libraries static.
+  # is overly broad for our subset — we neuter it (postPatch, below) and drop the
+  # bits that don't static-link cleanly (dnstap, and jemalloc, whose only-C++ dep
+  # would drag in libstdc++). We build only lib/ + the three client bin dirs;
+  # named/the server tools would add applets we don't ship.
   #
-  # macOS reuses the same force-static base and cpp-rename multicall fold; only
-  # the *degree* of static differs. Linux folds everything (musl, libtool
-  # `-all-static`); darwin has no static libc, so it links bind's libraries (and
-  # every dep) from their `.a` archives but leaves libSystem dynamic — the
-  # catalog's darwin policy. The platform forks are small and live inline:
-  #   * the rename harvest strips Mach-O's leading-underscore so the cpp `#define`
-  #     names match the source spelling (multicall.nix Phase A);
-  #   * the final link (multicall.nix Phase C) swaps `-all-static`/`--export-dynamic`
-  #     /`-lstdc++` for an archive-only ld64 link that folds libc++ statically
-  #     (jemalloc pulls it; libc++.1.dylib is off the allow-list), appends GNU
-  #     libiconv.a for libunistring, and force-includes bind's `isc__initialize`
-  #     constructor (glibc tolerates its absence, macOS aborts on the zeroed
-  #     mutex attr);
-  #   * gssapi/dnstap deps that don't even build static on darwin are dropped at
-  #     the `override` (below).
-  # See docs/platforms/darwin.md.
+  # macOS runs the same engine fold but needs a handful of darwin-only fixes,
+  # each documented at its site: bind's `gen` build-cc pin, the two source
+  # tweaks that make isc__initialize's constructor run once in the folded binary
+  # (shared postPatch), and clearing bind's multi-output postInstall/postFixup
+  # (the isDarwin block). aarch64-darwin can't be checked by the local x86_64
+  # cross helper (bind's `gen` must run on the build host) — its source of truth
+  # is CI macos-14.
   outputs = { self, unpins-lib }:
     let lib = unpins-lib.lib;
     in
@@ -50,16 +43,13 @@
       smoke = [ "--unpin-program=dig" "-v" ];
       smokePattern = "DiG 9\\.";
 
-      # Build via the unpin-llvm engine + emit a bitcode multicall module. On
-      # Linux the engine compiles the force-static bind (guard neutered;
-      # gssapi/dnstap/libxml2 dropped; libedit+embedded-ncurses for line editing)
-      # to bitcode, letting make link dig/host/nslookup/delv/nsupdate as the five
+      # Build via the unpin-llvm engine + emit a bitcode multicall module. The
+      # engine compiles the force-static bind (guard neutered; gssapi/dnstap/
+      # libxml2/jemalloc dropped; libedit+embedded-ncurses for line editing) to
+      # bitcode, letting make link dig/host/nslookup/delv/nsupdate as the five
       # separate binaries upstream builds by default — the engine captures each
-      # link sidecar and the standalone self-folds them into one `dnsutils`
-      # binary. darwin/windows keep the cpp-rename fold in ./multicall.nix (which
-      # needs the throwaway-link-avoiding `.o`-only buildPhase; that build is
-      # incompatible with the engine's per-program link capture, so the engine
-      # path uses bind's normal build+install instead). Pure C — no requires.cxx.
+      # link and the standalone self-folds them into one `dnsutils`. Same on Linux
+      # and darwin (dnsutils has no windows target). Pure C — no requires.cxx.
       engine = "unpin-llvm";
       multicall = {
         programs = [
@@ -75,7 +65,6 @@
       build = pkgs:
         let
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-          isLinux = pkgs.stdenv.hostPlatform.isLinux;
           # openssl is retargeted (OPENSSLDIR/ENGINESDIR/MODULESDIR off /nix/store
           # to /etc/ssl, so static libcrypto bakes no store paths and dig's TLS
           # consults the host trust store) by nix-lib's native-overlay/openssl.nix —
@@ -93,10 +82,52 @@
           # same as htop) + the ~35 compiled-in fallbacks into every engine
           # ncurses, linux + darwin, so pkgsStatic.ncurses is already that one
           # shared, deduped copy — no per-package override.
-          embeddedNcurses = pkgs.pkgsStatic.ncurses;
-          libeditStatic = pkgs.pkgsStatic.libedit.override { ncurses = embeddedNcurses; };
-          bindStatic = (pkgs.pkgsStatic.bind.override ({
-            openssl = pkgs.pkgsStatic.openssl;
+          #
+          # liburcu (userspace-rcu, pulled by bind) builds a suite of C++ test
+          # programs as part of `make all`, and two of them break only on the
+          # 32-bit engine targets — never in the STATIC C library bind folds in:
+          #   * i686:   test_build_dynlink_cxx (a C++/shared-lib build-interface
+          #             probe) miscompares — cds_lfs_empty reports non-empty right
+          #             after init when that TU is compiled as C++. The C probe
+          #             passes, all 433 functional tests pass, and the whole suite
+          #             passes on x86_64, so the RCU logic is sound; only this C++
+          #             probe trips. (i686 is a musl cross whose binaries still
+          #             run on the x86_64 builder, so nixpkgs keeps doCheck on;
+          #             the real crosses never run target tests.)
+          #   * armv7l: test_urcu_multiflavor_single_unit_cxx fails to *link* —
+          #             the engine's ARM-EHABI libunwind.a has an unresolved
+          #             intra-unwinder symbol (unwindOneFrame) when pulled into a
+          #             C++ exe. This is a latent engine defect for C++-on-armv7l
+          #             at large, but bind is pure C and never hits it.
+          # bind links only liburcu's static C library, which these C++ test
+          # programs never touch. Restrict SUBDIRS to skip the tests subdir on the
+          # two 32-bit arches (build + check + install) — a config bind never
+          # ships. Via an overlay because liburcu is a *spliced* buildInput of
+          # bind (not a bind.override arg), so overrideAttrs on bind's buildInputs
+          # would silently no-op. Gated so every other arch's liburcu — and thus
+          # bind — stays byte-identical.
+          pkgsS = pkgs.pkgsStatic.extend (final: prev: {
+            liburcu =
+              if prev.stdenv.hostPlatform.isi686 || prev.stdenv.hostPlatform.isAarch32
+              then prev.liburcu.overrideAttrs (o: {
+                # Drop the tests+extras subdirs from the *top-level* Makefile only
+                # (bind needs neither). A make-var override — SUBDIRS= on the
+                # command line or via makeFlagsArray — is wrong here: recursive
+                # make propagates it to every sub-make, so the doc/ sub-make would
+                # then try to recurse into include/src/doc under doc/. Editing the
+                # generated top Makefile keeps each sub-make's own SUBDIRS intact.
+                postConfigure = (o.postConfigure or "") + ''
+                  substituteInPlace Makefile --replace-fail \
+                    'SUBDIRS = include src doc tests extras' \
+                    'SUBDIRS = include src doc'
+                '';
+              })
+              else prev.liburcu;
+          });
+          embeddedNcurses = pkgsS.ncurses;
+          libeditStatic = pkgsS.libedit.override { ncurses = embeddedNcurses; };
+          bindStatic = (pkgsS.bind.override ({
+            openssl = pkgsS.openssl;
             libxml2 = null;
             # GSS-TSIG (gssapi/krb5) can't static-link into bind — the catalog
             # has always dropped it for dnsutils. `enableGSSAPI = false` removes
@@ -114,14 +145,19 @@
             # darwin and trims an unused chunk of the closure on every platform.
             fstrm = null;
             protobufc = null;
-          } // pkgs.lib.optionalAttrs isLinux {
-            # Engine (Linux) path: jemalloc's static lib pulls `-lstdc++` (its
-            # C++ bits) via jemalloc.pc, and the engine toolchain ships libc++
-            # (not GNU libstdc++) — so bind's tool links fail with "unable to
-            # find library -lstdc++". The fold path (darwin/windows) relinks by
-            # hand and absorbs it; the engine link goes through bind's own
-            # libtool line, so drop jemalloc here and let the five short-lived
-            # client tools use the default musl allocator (no C++ dep → pure C).
+            # Drop jemalloc on every platform. jemalloc is a performance
+            # allocator for the long-running `named` server; the five one-shot
+            # client tools we ship (dig/host/nslookup/delv/nsupdate) run for
+            # milliseconds and exit, so the default allocator is entirely
+            # adequate — no user-facing feature is lost. Dropping it also sheds
+            # jemalloc's only-C++ dependency (its `operator new`/`delete`
+            # overrides pull `-lstdc++`): the engine toolchain ships libc++ not
+            # GNU libstdc++, so on Linux bind's libtool link failed to find
+            # `-lstdc++`, and on darwin jemalloc's own configure fails outright
+            # under the engine cc (`-Werror` strerror_r probe → "cannot
+            # determine return type of strerror_r"). With jemalloc gone the whole
+            # build is pure C on both platforms — nothing pulls libc++ into the
+            # fold.
             jemalloc = null;
           })).overrideAttrs (old: ({
             # libedit isn't a bind.override parameter, so add it (with the
@@ -129,9 +165,51 @@
             # libedit.pc and `--with-readline=libedit` wires it into nslookup/
             # nsupdate.
             buildInputs = (old.buildInputs or [ ]) ++ [ libeditStatic embeddedNcurses ];
+            # Neutralize bind's static-linking guard (configure aborts "Static
+            # linking is not supported …" when enable_static != no unless
+            # --enable-developer). The dnsutils client tools use none of the
+            # dlopen'd machinery the guard protects, and a static self-contained
+            # binary is the whole point, so replace the error with a no-op. Both
+            # platforms need this; keep the two darwin-only source fixes in the
+            # SAME postPatch (gated below) rather than the isDarwin attrs — a
+            # `postPatch` there would shadow, not append to, this one.
             postPatch = (old.postPatch or "") + ''
               substituteInPlace configure \
                 --replace-fail 'as_fn_error $? "Static linking is not supported as it disables dlopen() and certain security features (e.g. RELRO, ASLR)"' ': '
+            ''
+            + pkgs.lib.optionalString isDarwin ''
+              # (darwin) Force lib/isc/lib.o — and its isc__initialize constructor
+              # — into every tool's engine module. isc__initialize
+              # (__attribute__((constructor))) sets up mutex attrs, arenas, TLS,
+              # hashing and rcu registration, but nothing references it by symbol,
+              # so neither the static linker nor the fold's llvm-link pulls lib.o
+              # and it never runs. glibc tolerates the zeroed mutexattr (Linux limps
+              # on); macOS aborts at the first isc_mutex_init ("pthread_mutex_init():
+              # Invalid argument (22)"). A -u linker flag can't help — the engine
+              # builds each module from the captured object list via llvm-link,
+              # which ignores -u. So plant a real symbol reference from mem.c
+              # (always linked — it owns isc_mem_create, the TU that aborts); `used`
+              # shields it from opt -internalize.
+              {
+                echo 'void isc__initialize(void);'
+                echo '__attribute__((used)) static void (*const isc__unpin_force_init)(void) = isc__initialize;'
+              } >> lib/isc/mem.c
+              # (darwin) Register the main thread with liburcu exactly once. That
+              # reference pulls lib.o into all five programs' modules, each of which
+              # internalizes isc__initialize, so the fold's LTO keeps five renamed
+              # copies — the constructor fires five times at startup. Its body MUST
+              # run every time (libisc's globals are internalized per module too, so
+              # each program inits its own mutex/arena/TLS copies), but
+              # rcu_register_thread() acts on the single shared liburcu depArchive,
+              # so calls 2..5 re-register the main thread and trip liburcu's
+              # assertion (urcu.c:486). Guard ONLY the rcu (un)register calls on a
+              # process-global (the environment, immune to per-module symbol
+              # duplication). Verified: bind's own standalone dig, pre-fold, is clean.
+              substituteInPlace lib/isc/lib.c \
+                --replace-fail 'rcu_register_thread();' \
+                  '{ extern char *getenv(const char *); extern int setenv(const char *, const char *, int); if (!getenv("UNPIN_RCU_MAIN")) { setenv("UNPIN_RCU_MAIN", "1", 1); rcu_register_thread(); } }' \
+                --replace-fail 'rcu_unregister_thread();' \
+                  '{ extern char *getenv(const char *); extern int unsetenv(const char *); if (getenv("UNPIN_RCU_MAIN")) { unsetenv("UNPIN_RCU_MAIN"); rcu_unregister_thread(); } }'
             '';
             # dnstap (fstrm/protobuf-c) has no upstream toggle and its static link
             # is fragile; the dnsutils client tools don't use it. Force it off.
@@ -163,61 +241,18 @@
               # we don't ship); the bin/ subset is selected by the program list.
               ;
           }
-          # The fold-only build/install (`.o`-only buildPhase, single `out`
-          # output) is for the darwin/windows cpp-rename path. The engine (Linux)
-          # path uses bind's NORMAL build+install so make links the five client
-          # tools as separate binaries for the engine to capture — so skip these
-          # overrides on Linux.
-          // pkgs.lib.optionalAttrs (!isLinux) {
-            # Build only what the five client tools need. `bind.keys.h` is a
-            # top-level perl-generated BUILT_SOURCE — it must exist before the
-            # bin dirs compile (delv.c includes it) — then lib/, then *only the
-            # object files* of each client tool.
-            #
-            # We deliberately stop at the .o targets and never let make link the
-            # standalone tool executables: those binaries are throwaway (multicall
-            # relinks from these objects in Phase C), and on darwin their link
-            # trips an iconv ordering trap — bind's libtool reorders `-lunistring`
-            # after the cc-wrapper's appended `-liconv`, so ld64's single pass
-            # can't resolve libunistring.a's `_libiconv_open`. Building objects
-            # only sidesteps the throwaway link on every platform; the one link we
-            # keep (Phase C) lists the libraries in the order ld64 needs.
-            buildPhase = ''
-              runHook preBuild
-              make bind.keys.h
-              # libns bakes `-DNAMED_PLUGINDIR="$(pkglibdir)"` (= $out/lib/bind,
-              # the autoconf default) into hooks.c; delv links libns, so that
-              # store path would ride along as a (self-)reference even though the
-              # client tools never load a plugin (only named's `plugin`
-              # statement reaches hooks.c). Override pkglibdir to the conventional
-              # system location at compile time so the binary is genuinely
-              # 0-ref — same rationale as the OPENSSLDIR retarget above.
-              make -C lib -j$NIX_BUILD_CORES pkglibdir=/usr/lib/bind
-              make -C bin/dig -j$NIX_BUILD_CORES dig.o dighost.o host.o nslookup-nslookup.o
-              make -C bin/delv -j$NIX_BUILD_CORES delv.o
-              make -C bin/nsupdate -j$NIX_BUILD_CORES nsupdate.o
-              # Man pages: bind ships pre-generated docutils templates
-              # (doc/man/*.1in) that the `.1in.1` rule turns into real .1 with a
-              # pure-sed placeholder substitution (no sphinx). Build the five we
-              # ship so the multicall install can embed them.
-              make -C doc/man -j$NIX_BUILD_CORES dig.1 host.1 nslookup.1 delv.1 nsupdate.1
-              runHook postBuild
-            '';
-            # bind is a 6-output derivation (out/lib/dev/man/dnsutils/host); the
-            # multicall installPhase only produces `out`.
-            outputs = [ "out" ];
-            meta = (old.meta or { }) // { outputsToInstall = [ "out" ]; };
-            dontPatchELF = true;
-            separateDebugInfo = false;
-          }
-          # Engine (Linux) path: build + LINK only the five client tools (lib/ +
-          # the three client bin dirs), never named/the server tools — named
-          # links C++ (`-lstdc++`, unavailable unprefixed under the engine) and
-          # would add applets we don't ship. Unlike the fold path we DO let make
-          # link each tool: that real link is what the engine captures per
-          # program for the bitcode self-fold. Install just the five binaries +
-          # their man pages into the single `out`.
-          // pkgs.lib.optionalAttrs isLinux {
+          # Engine path (all platforms). Build + LINK only the five client tools
+          # (lib/ + the three client bin dirs), never named/the server tools —
+          # named links C++ and would add applets we don't ship. make links each
+          # tool as a separate static binary and the unpin-llvm engine captures
+          # each link into a per-program bitcode module; the standalone then
+          # self-folds the five into one `dnsutils`. Identical mechanism on Linux
+          # and darwin — darwin used to hand-fold via a cpp-rename ./multicall.nix,
+          # retired now that the engine self-fold works on macOS too (useEngine is
+          # forced on for darwin). Install just the five binaries + their man
+          # pages into the single `out`.
+          //
+          {
             outputs = [ "out" ];
             meta = (old.meta or { }) // { outputsToInstall = [ "out" ]; };
             buildPhase = ''
@@ -247,10 +282,51 @@
             '';
             dontPatchELF = true;
             separateDebugInfo = false;
+          }
+          // pkgs.lib.optionalAttrs isDarwin {
+            # bind compiles its `gen` build helper with BUILD_CC=$(CC_FOR_BUILD).
+            # pkgsStatic makes host≠build, so nixpkgs adds that flag and the
+            # stdenv points CC_FOR_BUILD at the *vanilla* darwin `clang`, whose
+            # wrapper drives the ELF ld.lld and chokes on the Mach-O compiler-rt
+            # ("archive member … neither ET_REL nor LLVM bitcode") — it cannot
+            # link an executable, so bind's build-cc conftest fails. Every darwin
+            # build that ships is native (build == host: x86_64 on macos-13,
+            # arm64 on macos-14), so the host engine cc ($CC — e.g.
+            # x86_64-apple-darwin-clang / arm64-apple-darwin-clang, both linking
+            # via ld64.lld) is also the build cc and compiles/runs `gen` fine; pin
+            # CC_FOR_BUILD to it. ($CC is arch-correct on both runners — hardcoding
+            # x86_64 would break the arm64 runner. The local aarch64-darwin *cross*
+            # check can't get here: bind's `gen` must run on the x86_64 build host,
+            # and the cross build cc is broken, so aarch64-darwin's source of truth
+            # is CI macos-14.) Darwin-gated → Linux bind stays byte-identical.
+            preConfigure = (old.preConfigure or "") + ''
+              export CC_FOR_BUILD=$CC
+            '';
+            # Drop bind's stock postInstall on darwin. It runs `moveToOutput
+            # bin/{host,dig,…} $host/$dnsutils`, but this override collapses bind
+            # to a single `out`, so those output vars are empty and moveToOutput
+            # targets the absolute `/bin/host`. Linux's sandbox has an ephemeral
+            # writable `/bin`, so the move silently succeeds into the void (the
+            # engine already captured the objects in buildPhase, so it's harmless
+            # and byte-identical); macOS's sandbox `/bin` is the real read-only
+            # system dir, so the move fails "Operation not permitted". Our own
+            # installPhase already places every tool in $out/bin, so bind's
+            # postInstall is dead weight — clear it. Darwin-gated → Linux keeps
+            # bind's postInstall and stays byte-identical.
+            postInstall = "";
+            # Same single-output fallout for bind's postFixup, which runs
+            # `remove-references-to -t $out "$dnsutils/bin/delv"` → an empty
+            # $dnsutils makes it operate on the absolute `/bin/delv`. On Linux
+            # that file exists (moveToOutput just parked it in the sandbox's
+            # ephemeral /bin), so the scrub is a harmless no-op; on macOS we
+            # skipped that move, so /bin/delv is absent and remove-references-to
+            # feeds sed nothing ("sed: no input files"). delv already lives in
+            # $out/bin via our installPhase and the engine fold ships the module,
+            # not bind's $out — so this scrub is moot. Darwin-gated → Linux stays
+            # byte-identical.
+            postFixup = "";
           }));
         in
-        if isLinux
-        then bindStatic
-        else import ./multicall.nix { inherit lib; } { inherit pkgs; basePkg = bindStatic; };
+        bindStatic;
     };
 }

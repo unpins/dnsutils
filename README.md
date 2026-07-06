@@ -60,20 +60,23 @@ The [Releases](https://github.com/unpins/dnsutils/releases) page has standalone 
   `libSystem` dynamic (the catalog's macOS policy) — `otool -L` shows only
   `libSystem`.
 - **One binary, five tools:** dig, host and nslookup share BIND's `dighost`
-  resolver core; delv and nsupdate are standalone. They're folded into one binary
-  with the cpp-rename multicall recipe (each tool recompiled into its own private
-  symbol namespace, then linked together), so `bin/dnsutils` is the real binary
-  and `dig`/`host`/`nslookup`/`delv`/`nsupdate` are `argv[0]` aliases.
+  resolver core; delv and nsupdate are standalone. The unpin-llvm engine compiles
+  each with LTO, captures its link into a per-program bitcode module, and the
+  standalone self-folds the five into one binary — so `bin/dnsutils` is the real
+  binary and `dig`/`host`/`nslookup`/`delv`/`nsupdate` are `argv[0]` aliases. Same
+  fold on Linux and macOS (earlier macOS used a hand-rolled cpp-rename recipe,
+  retired once the engine self-fold worked on Darwin).
 - **Force-static:** BIND's `configure` refuses to static-link (it disables
   `dlopen()`, which `named`'s plugins/dyndb/dnstap need). The client tools use
   none of that, so we neuter the guard and drop the parts that genuinely can't
-  static-link (krb5/GSSAPI, dnstap).
-- **macOS specifics:** the darwin link folds the C++ runtime statically
-  (`libc++.a`/`libc++abi.a` — pulled in by jemalloc's `operator new`/`delete`)
-  since the allow-list forbids `libc++.1.dylib`, appends GNU `libiconv.a` for
-  libunistring's `iconv` references, and force-includes BIND's library
-  constructor (`isc__initialize`) so its mutex/memory/RCU setup runs — glibc
-  tolerates the missing constructor, macOS does not.
+  static-link (krb5/GSSAPI, dnstap) plus jemalloc (a `named`-server allocator
+  whose only-C++ symbols would otherwise drag in libstdc++) — the build is pure C.
+- **macOS specifics:** the Darwin fold needs a few native-only fixes — pinning
+  BIND's `gen` build-cc, forcing BIND's library constructor (`isc__initialize`,
+  which sets up mutex/memory/TLS/RCU) to run exactly once across the folded copies
+  (glibc tolerates its absence, macOS aborts on the zeroed mutex attr), and using
+  GNU `libiconv` for libunistring's `iconv` references. aarch64-darwin is built
+  and verified on CI (the local cross helper can't run BIND's build-time `gen`).
 - **`OPENSSLDIR` = `/etc/ssl`:** libcrypto is retargeted off `/nix/store` to the
   conventional system path (same as the [`openssl`](https://github.com/unpins/openssl)
   package), so `dig +tls` consults the host trust store and the binary carries no
