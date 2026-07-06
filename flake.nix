@@ -25,13 +25,14 @@
   # would drag in libstdc++). We build only lib/ + the three client bin dirs;
   # named/the server tools would add applets we don't ship.
   #
-  # macOS runs the same engine fold but needs a handful of darwin-only fixes,
-  # each documented at its site: bind's `gen` build-cc pin, the two source
-  # tweaks that make isc__initialize's constructor run once in the folded binary
-  # (shared postPatch), and clearing bind's multi-output postInstall/postFixup
-  # (the isDarwin block). aarch64-darwin can't be checked by the local x86_64
-  # cross helper (bind's `gen` must run on the build host) — its source of truth
-  # is CI macos-14.
+  # We collapse bind to a single `out` and install the five tools ourselves, so
+  # bind's stock multi-output postInstall/postFixup are cleared on BOTH platforms
+  # (they'd otherwise moveToOutput into the read-only sandbox `/bin`). macOS then
+  # adds two darwin-only fixes, each documented at its site: bind's `gen` build-cc
+  # pin (preConfigure) and the two source tweaks that make isc__initialize's
+  # constructor run once in the folded binary (shared postPatch). aarch64-darwin
+  # can't be checked by the local x86_64 cross helper (bind's `gen` must run on the
+  # build host) — its source of truth is CI macos-14.
   outputs = { self, unpins-lib }:
     let lib = unpins-lib.lib;
     in
@@ -282,6 +283,19 @@
             '';
             dontPatchELF = true;
             separateDebugInfo = false;
+            # Clear bind's stock postInstall/postFixup on BOTH platforms. This
+            # override collapses bind to a single `out`, so bind's
+            # `moveToOutput bin/{host,dig,…} $host` and
+            # `remove-references-to -t $out "$dnsutils/bin/delv"` see empty output
+            # vars and target the ABSOLUTE `/bin/host` / `/bin/delv`. The nix build
+            # sandbox mounts `/bin` read-only (on CI Linux and macOS alike), so the
+            # move dies "Permission denied" — CI-Linux caught this even though a
+            # local build with a writable sandbox `/bin` let it slip into the void.
+            # Our own installPhase already puts all five tools in $out/bin and the
+            # engine fold ships the captured modules (not bind's $out), so both
+            # hooks are pure dead weight — dropping them leaves $out byte-identical.
+            postInstall = "";
+            postFixup = "";
           }
           // pkgs.lib.optionalAttrs isDarwin {
             # bind compiles its `gen` build helper with BUILD_CC=$(CC_FOR_BUILD).
@@ -302,29 +316,6 @@
             preConfigure = (old.preConfigure or "") + ''
               export CC_FOR_BUILD=$CC
             '';
-            # Drop bind's stock postInstall on darwin. It runs `moveToOutput
-            # bin/{host,dig,…} $host/$dnsutils`, but this override collapses bind
-            # to a single `out`, so those output vars are empty and moveToOutput
-            # targets the absolute `/bin/host`. Linux's sandbox has an ephemeral
-            # writable `/bin`, so the move silently succeeds into the void (the
-            # engine already captured the objects in buildPhase, so it's harmless
-            # and byte-identical); macOS's sandbox `/bin` is the real read-only
-            # system dir, so the move fails "Operation not permitted". Our own
-            # installPhase already places every tool in $out/bin, so bind's
-            # postInstall is dead weight — clear it. Darwin-gated → Linux keeps
-            # bind's postInstall and stays byte-identical.
-            postInstall = "";
-            # Same single-output fallout for bind's postFixup, which runs
-            # `remove-references-to -t $out "$dnsutils/bin/delv"` → an empty
-            # $dnsutils makes it operate on the absolute `/bin/delv`. On Linux
-            # that file exists (moveToOutput just parked it in the sandbox's
-            # ephemeral /bin), so the scrub is a harmless no-op; on macOS we
-            # skipped that move, so /bin/delv is absent and remove-references-to
-            # feeds sed nothing ("sed: no input files"). delv already lives in
-            # $out/bin via our installPhase and the engine fold ships the module,
-            # not bind's $out — so this scrub is moot. Darwin-gated → Linux stays
-            # byte-identical.
-            postFixup = "";
           }));
         in
         bindStatic;
