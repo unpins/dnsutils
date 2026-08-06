@@ -60,7 +60,6 @@
           { name = "delv"; }
           { name = "nsupdate"; }
         ];
-        defaultProgram = "dig";
       };
 
       build = pkgs:
