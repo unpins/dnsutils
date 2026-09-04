@@ -13,16 +13,17 @@ Part of the [unpins](https://unpins.org) catalog; install it with [`unpin`](http
 
 ## Usage
 
-Run any of the five tools through [unpin](https://github.com/unpins/unpin) — the
-name after `dnsutils` selects the applet:
+Run any of the five tools through [unpin](https://github.com/unpins/unpin):
 
 ```bash
-unpin dnsutils dig example.com AAAA
-unpin dnsutils host example.com
-unpin dnsutils nslookup example.com
-unpin dnsutils delv example.com          # like dig, but validates DNSSEC
-unpin dnsutils nsupdate -k key.file      # dynamic DNS updates
+unpin dnsutils --unpin-program=dig example.com AAAA
+unpin dnsutils --unpin-program=host example.com
+unpin dnsutils --unpin-program=nslookup example.com
+unpin dnsutils --unpin-program=delv example.com     # like dig, but validates DNSSEC
+unpin dnsutils --unpin-program=nsupdate -k key.file # dynamic DNS updates
 ```
+
+A bare `unpin dnsutils` lists the programs it holds.
 
 To install them onto your PATH:
 
@@ -31,19 +32,20 @@ unpin install dnsutils
 ```
 
 `unpin install dnsutils` creates `dig`, `host`, `nslookup`, `delv` and
-`nsupdate`. `unpin info dnsutils` lists every command.
+`nsupdate`; once they are on your PATH you can call them by name — `dig
+example.com`. `unpin info dnsutils` lists every command.
 
 ## Build locally
 
 ```bash
 nix build github:unpins/dnsutils
-./result/bin/dig -v
+./result/bin/dnsutils --unpin-program=dig -v
 ```
 
 Or run directly:
 
 ```bash
-nix run github:unpins/dnsutils -- dig example.com
+nix run github:unpins/dnsutils -- --unpin-program=dig example.com
 ```
 
 The first invocation will offer to add the [unpins.cachix.org](https://unpins.cachix.org) substituter so most pulls come pre-built.
@@ -71,12 +73,15 @@ The [Releases](https://github.com/unpins/dnsutils/releases) page has standalone 
   none of that, so we neuter the guard and drop the parts that genuinely can't
   static-link (krb5/GSSAPI, dnstap) plus jemalloc (a `named`-server allocator
   whose only-C++ symbols would otherwise drag in libstdc++) — the build is pure C.
-- **macOS specifics:** the Darwin fold needs a few native-only fixes — pinning
-  BIND's `gen` build-cc, forcing BIND's library constructor (`isc__initialize`,
-  which sets up mutex/memory/TLS/RCU) to run exactly once across the folded copies
-  (glibc tolerates its absence, macOS aborts on the zeroed mutex attr), and using
-  GNU `libiconv` for libunistring's `iconv` references. aarch64-darwin is built
-  and verified on CI (the local cross helper can't run BIND's build-time `gen`).
+- **BIND's library constructor:** libisc sets up its digest table, mutexes,
+  arenas and TLS from a constructor in a source file nothing references by name,
+  so nothing pulled that file into the binary and the setup never ran — every
+  hash came back unsupported, which broke `delv` and TSIG. The build forces that
+  file in and runs its RCU registration exactly once across the folded copies.
+  Needed on every platform.
+- **macOS specifics:** pinning BIND's `gen` build-cc, and GNU `libiconv` for
+  libunistring's `iconv` references. aarch64-darwin is built and verified on CI
+  (the local cross helper can't run BIND's build-time `gen`).
 - **`OPENSSLDIR` = `/etc/ssl`:** libcrypto is retargeted off `/nix/store` to the
   conventional system path (same as the [`openssl`](https://github.com/unpins/openssl)
   package), so `dig +tls` consults the host trust store and the binary carries no

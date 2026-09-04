@@ -27,12 +27,13 @@
   #
   # We collapse bind to a single `out` and install the five tools ourselves, so
   # bind's stock multi-output postInstall/postFixup are cleared on BOTH platforms
-  # (they'd otherwise moveToOutput into the read-only sandbox `/bin`). macOS then
-  # adds two darwin-only fixes, each documented at its site: bind's `gen` build-cc
-  # pin (preConfigure) and the two source tweaks that make isc__initialize's
-  # constructor run once in the folded binary (shared postPatch). aarch64-darwin
-  # can't be checked by the local x86_64 cross helper (bind's `gen` must run on the
-  # build host) — its source of truth is CI macos-14.
+  # (they'd otherwise moveToOutput into the read-only sandbox `/bin`). Two source
+  # tweaks in postPatch make libisc's isc__initialize constructor reachable from
+  # the fold and run its rcu registration exactly once — needed on every platform,
+  # documented at their site. macOS adds one fix of its own: bind's `gen` build-cc
+  # pin (preConfigure). aarch64-darwin can't be checked by the local x86_64 cross
+  # helper (bind's `gen` must run on the build host) — its source of truth is CI
+  # macos-14.
   outputs = { self, unpins-lib }:
     let lib = unpins-lib.lib;
     in
@@ -169,32 +170,38 @@
             # linking is not supported …" when enable_static != no unless
             # --enable-developer). The dnsutils client tools use none of the
             # dlopen'd machinery the guard protects, and a static self-contained
-            # binary is the whole point, so replace the error with a no-op. Both
-            # platforms need this; keep the two darwin-only source fixes in the
-            # SAME postPatch (gated below) rather than the isDarwin attrs — a
-            # `postPatch` there would shadow, not append to, this one.
+            # binary is the whole point, so replace the error with a no-op. The
+            # isc__initialize fixes below live in this SAME postPatch rather than
+            # a platform attrs set — a `postPatch` there would shadow, not append
+            # to, this one.
             postPatch = (old.postPatch or "") + ''
               substituteInPlace configure \
                 --replace-fail 'as_fn_error $? "Static linking is not supported as it disables dlopen() and certain security features (e.g. RELRO, ASLR)"' ': '
-            ''
-            + pkgs.lib.optionalString isDarwin ''
-              # (darwin) Force lib/isc/lib.o — and its isc__initialize constructor
-              # — into every tool's engine module. isc__initialize
+              # Force lib/isc/lib.o — and its isc__initialize constructor — into
+              # every tool's engine module. isc__initialize
               # (__attribute__((constructor))) sets up mutex attrs, arenas, TLS,
-              # hashing and rcu registration, but nothing references it by symbol,
-              # so neither the static linker nor the fold's llvm-link pulls lib.o
-              # and it never runs. glibc tolerates the zeroed mutexattr (Linux limps
-              # on); macOS aborts at the first isc_mutex_init ("pthread_mutex_init():
-              # Invalid argument (22)"). A -u linker flag can't help — the engine
-              # builds each module from the captured object list via llvm-link,
-              # which ignores -u. So plant a real symbol reference from mem.c
-              # (always linked — it owns isc_mem_create, the TU that aborts); `used`
+              # hashing, libisc's OpenSSL digest table and rcu registration, but
+              # nothing references it by symbol, so neither the static linker nor
+              # the fold's llvm-link pulls lib.o and it never runs. macOS aborts at
+              # the first isc_mutex_init ("pthread_mutex_init(): Invalid argument
+              # (22)"), which is why this started as a darwin-only fix. Linux does
+              # not abort — and that is what hid the rest of the damage: with
+              # isc__md_initialize() never called, `isc__md_sha256` and its siblings
+              # stay NULL and every isc_md() returns ISC_R_NOTIMPLEMENTED.
+              # dig/host/nslookup hash nothing at startup and looked healthy, but
+              # delv builds a view first, and dns_view_create's opening move is
+              # isc_file_sanitize() -> isc_md(SHA256): every delv query failed with
+              # ";; resolution failed: not implemented" without a packet leaving the
+              # host. The constructor is needed on every platform. A -u linker flag
+              # can't help — the engine builds each module from the captured object
+              # list via llvm-link, which ignores -u. So plant a real symbol
+              # reference from mem.c (always linked — it owns isc_mem_create); `used`
               # shields it from opt -internalize.
               {
                 echo 'void isc__initialize(void);'
                 echo '__attribute__((used)) static void (*const isc__unpin_force_init)(void) = isc__initialize;'
               } >> lib/isc/mem.c
-              # (darwin) Register the main thread with liburcu exactly once. That
+              # Register the main thread with liburcu exactly once. That
               # reference pulls lib.o into all five programs' modules, each of which
               # internalizes isc__initialize, so the fold's LTO keeps five renamed
               # copies — the constructor fires five times at startup. Its body MUST
@@ -211,6 +218,24 @@
                 --replace-fail 'rcu_unregister_thread();' \
                   '{ extern char *getenv(const char *); extern int unsetenv(const char *); if (getenv("UNPIN_RCU_MAIN")) { unsetenv("UNPIN_RCU_MAIN"); rcu_unregister_thread(); } }'
             '';
+            # Keep musl's malloc in the link. LLVM's LTO rewrites library calls
+            # AFTER lld has finished scanning the archives — here libedit's
+            # reallocarr() (`realloc(NULL, n)`) becomes a `malloc(n)` call, and
+            # by then nothing had asked libc.a for malloc.o, so nslookup fails to
+            # link with "undefined symbol: malloc" while lld helpfully notes that
+            # calloc IS defined in the same nslookup.lto.o. lld pre-declares the
+            # compiler-rt runtime libcalls for exactly this reason, but malloc
+            # reaches codegen through TargetLibraryInfo and is not on that list.
+            # `-u malloc` puts it back. Latent for any engine target that
+            # LTO-links a static libc — krb5's krb5kdc dies the same way — and
+            # the trigger is only which functions end up in the module: making
+            # isc__initialize reachable (above) is what tipped nslookup over.
+            # Not on darwin: libc is dynamic there, so no archive scan can miss
+            # malloc, and Mach-O's leading underscore would make `-u malloc` ask
+            # for a symbol that exists nowhere — every link fails, starting with
+            # configure's "C compiler cannot create executables".
+            NIX_LDFLAGS = (old.NIX_LDFLAGS or "")
+              + pkgs.lib.optionalString (!isDarwin) " -u malloc";
             # dnstap (fstrm/protobuf-c) has no upstream toggle and its static link
             # is fragile; the dnsutils client tools don't use it. Force it off.
             configureFlags =
