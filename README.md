@@ -61,13 +61,6 @@ The [Releases](https://github.com/unpins/dnsutils/releases) page has standalone 
   BIND's libraries and every dependency from their `.a` archives while leaving
   `libSystem` dynamic (the catalog's macOS policy) — `otool -L` shows only
   `libSystem`.
-- **One binary, five tools:** dig, host and nslookup share BIND's `dighost`
-  resolver core; delv and nsupdate are standalone. The unpin-llvm engine compiles
-  each with LTO, captures its link into a per-program bitcode module, and the
-  standalone self-folds the five into one binary — so `bin/dnsutils` is the real
-  binary and `dig`/`host`/`nslookup`/`delv`/`nsupdate` are `argv[0]` aliases. Same
-  fold on Linux and macOS (earlier macOS used a hand-rolled cpp-rename recipe,
-  retired once the engine self-fold worked on Darwin).
 - **Force-static:** BIND's `configure` refuses to static-link (it disables
   `dlopen()`, which `named`'s plugins/dyndb/dnstap need). The client tools use
   none of that, so we neuter the guard and drop the parts that genuinely can't
