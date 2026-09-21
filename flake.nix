@@ -218,24 +218,17 @@
                 --replace-fail 'rcu_unregister_thread();' \
                   '{ extern char *getenv(const char *); extern int unsetenv(const char *); if (getenv("UNPIN_RCU_MAIN")) { unsetenv("UNPIN_RCU_MAIN"); rcu_unregister_thread(); } }'
             '';
-            # Keep musl's malloc in the link. LLVM's LTO rewrites library calls
-            # AFTER lld has finished scanning the archives — here libedit's
-            # reallocarr() (`realloc(NULL, n)`) becomes a `malloc(n)` call, and
-            # by then nothing had asked libc.a for malloc.o, so nslookup fails to
-            # link with "undefined symbol: malloc" while lld helpfully notes that
-            # calloc IS defined in the same nslookup.lto.o. lld pre-declares the
-            # compiler-rt runtime libcalls for exactly this reason, but malloc
-            # reaches codegen through TargetLibraryInfo and is not on that list.
-            # `-u malloc` puts it back. Latent for any engine target that
-            # LTO-links a static libc — krb5's krb5kdc dies the same way — and
-            # the trigger is only which functions end up in the module: making
-            # isc__initialize reachable (above) is what tipped nslookup over.
-            # Not on darwin: libc is dynamic there, so no archive scan can miss
-            # malloc, and Mach-O's leading underscore would make `-u malloc` ask
-            # for a symbol that exists nowhere — every link fails, starting with
-            # configure's "C compiler cannot create executables".
-            NIX_LDFLAGS = (old.NIX_LDFLAGS or "")
-              + pkgs.lib.optionalString (!isDarwin) " -u malloc";
+            # This package used to add `-u malloc` to NIX_LDFLAGS. LLVM's LTO
+            # rewrites library calls AFTER lld has finished scanning the archives
+            # — libedit's reallocarr() (`realloc(NULL, n)`) becomes a `malloc(n)`
+            # call, and by then nothing had asked libc.a for malloc.o, so
+            # nslookup failed to link with "undefined symbol: malloc" while lld
+            # helpfully noted that calloc IS defined in the same nslookup.lto.o.
+            # It was never specific to nslookup — krb5's krb5kdc dies the same
+            # way — so nix-lib's engineLd now appends `-u malloc` to every full
+            # link on a Linux engine target, and darwin (dynamic libc, and a
+            # Mach-O leading underscore that would make `-u malloc` ask for a
+            # symbol that exists nowhere) is excluded there rather than here.
             # dnstap (fstrm/protobuf-c) has no upstream toggle and its static link
             # is fragile; the dnsutils client tools don't use it. Force it off.
             configureFlags =
