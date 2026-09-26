@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [9.20.29-1] - 2026-09-26
+
 - **`delv` works, and so does TSIG.** libisc sets up its digest table, mutex
   attributes, arenas and TLS from a constructor in a source file nothing
   references by name; nothing pulled that file into the binary, so the
