@@ -1,6 +1,6 @@
 # dnsutils
 
-The DNS client tools from [ISC BIND 9](https://www.isc.org/bind/) — what Debian
+The DNS client programs from [ISC BIND 9](https://www.isc.org/bind/) — what Debian
 ships as `bind9-dnsutils`: **dig**, **host**, **nslookup**, **delv** and
 **nsupdate**. A single self-contained binary, built natively for Linux and
 macOS.
@@ -13,7 +13,7 @@ Part of the [unpins](https://unpins.org) catalog; install it with [`unpin`](http
 
 ## Usage
 
-Run any of the five tools through [unpin](https://github.com/unpins/unpin):
+Run any of the five programs through [unpin](https://github.com/unpins/unpin):
 
 ```bash
 unpin dnsutils --unpin-program=dig example.com AAAA
@@ -62,7 +62,7 @@ The [Releases](https://github.com/unpins/dnsutils/releases) page has standalone 
   `libSystem` dynamic (the catalog's macOS policy) — `otool -L` shows only
   `libSystem`.
 - **Force-static:** BIND's `configure` refuses to static-link (it disables
-  `dlopen()`, which `named`'s plugins/dyndb/dnstap need). The client tools use
+  `dlopen()`, which `named`'s plugins/dyndb/dnstap need). The client programs use
   none of that, so we neuter the guard and drop the parts that genuinely can't
   static-link (krb5/GSSAPI, dnstap) plus jemalloc (a `named`-server allocator
   whose only-C++ symbols would otherwise drag in libstdc++) — the build is pure C.
