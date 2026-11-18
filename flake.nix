@@ -125,10 +125,7 @@
               })
               else prev.liburcu;
           });
-          embeddedNcurses = pkgsS.ncurses;
-          libeditStatic = pkgsS.libedit.override { ncurses = embeddedNcurses; };
           bindStatic = (pkgsS.bind.override ({
-            openssl = pkgsS.openssl;
             libxml2 = null;
             # GSS-TSIG (gssapi/krb5) can't static-link into bind — the catalog
             # has always dropped it for dnsutils. `enableGSSAPI = false` removes
@@ -165,7 +162,7 @@
             # embedded-terminfo ncurses) as a build input; pkg-config then finds
             # libedit.pc and `--with-readline=libedit` wires it into nslookup/
             # nsupdate.
-            buildInputs = (old.buildInputs or [ ]) ++ [ libeditStatic embeddedNcurses ];
+            buildInputs = (old.buildInputs or [ ]) ++ [ pkgsS.libedit pkgsS.ncurses ];
             # Neutralize bind's static-linking guard (configure aborts "Static
             # linking is not supported …" when enable_static != no unless
             # --enable-developer). The dnsutils client tools use none of the
