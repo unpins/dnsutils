@@ -1,0 +1,52 @@
+libisc's constructor in the multicall fold.
+
+isc__initialize (__attribute__((constructor)), lib/isc/lib.c) sets up mutex
+attrs, arenas, TLS, hashing, libisc's OpenSSL digest table and rcu
+registration, but nothing references it by symbol, so neither the static
+linker nor the fold's llvm-link pulls lib.o and it never runs. macOS aborts
+at the first isc_mutex_init ("pthread_mutex_init(): Invalid argument (22)").
+Linux does not abort, which hid the rest: with isc__md_initialize() never
+called, every isc_md() returns ISC_R_NOTIMPLEMENTED, and delv (whose
+dns_view_create opens with isc_file_sanitize() -> isc_md(SHA256)) failed
+every query with ";; resolution failed: not implemented". A -u linker flag
+can't help (the engine builds each module with llvm-link, which ignores -u),
+so mem.c (always linked: it owns isc_mem_create) plants a real reference;
+`used` shields it from opt -internalize.
+
+That pulls lib.o into all five programs' modules, each internalizing
+isc__initialize, so the constructor fires once per program at startup. Its
+body must run every time (libisc's globals are per module too), but
+rcu_register_thread() acts on the one shared liburcu, and calls 2..5 trip
+liburcu's assertion (urcu.c:486). Guard only the rcu (un)register calls on
+a process-global: the environment, immune to per-module duplication.
+
+diff --git a/lib/isc/lib.c b/lib/isc/lib.c
+index 4fd65e6..23279d2 100644
+--- a/lib/isc/lib.c
++++ b/lib/isc/lib.c
+@@ -54,7 +54,7 @@ isc__initialize(void) {
+ 	isc__hash_initialize();
+ 	isc__iterated_hash_initialize();
+ 	(void)isc_os_ncpus();
+-	rcu_register_thread();
++	{ extern char *getenv(const char *); extern int setenv(const char *, const char *, int); if (!getenv("UNPIN_RCU_MAIN")) { setenv("UNPIN_RCU_MAIN", "1", 1); rcu_register_thread(); } }
+ }
+ 
+ void
+@@ -68,5 +68,5 @@ isc__shutdown(void) {
+ 	isc__mutex_shutdown();
+ 	isc__os_shutdown();
+ 	/* should be after isc__mem_shutdown() which calls rcu_barrier() */
+-	rcu_unregister_thread();
++	{ extern char *getenv(const char *); extern int unsetenv(const char *); if (getenv("UNPIN_RCU_MAIN")) { unsetenv("UNPIN_RCU_MAIN"); rcu_unregister_thread(); } }
+ }
+diff --git a/lib/isc/mem.c b/lib/isc/mem.c
+index 8975cb3..9c395ea 100644
+--- a/lib/isc/mem.c
++++ b/lib/isc/mem.c
+@@ -1643,3 +1643,5 @@ isc__mem_printactive(isc_mem_t *ctx, FILE *file) {
+ 	UNUSED(file);
+ #endif /* if ISC_MEM_TRACKLINES */
+ }
++void isc__initialize(void);
++__attribute__((used)) static void (*const isc__unpin_force_init)(void) = isc__initialize;

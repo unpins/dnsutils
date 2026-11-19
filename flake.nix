@@ -163,58 +163,13 @@
             # libedit.pc and `--with-readline=libedit` wires it into nslookup/
             # nsupdate.
             buildInputs = (old.buildInputs or [ ]) ++ [ pkgsS.libedit pkgsS.ncurses ];
-            # Neutralize bind's static-linking guard (configure aborts "Static
-            # linking is not supported …" when enable_static != no unless
-            # --enable-developer). The dnsutils client tools use none of the
-            # dlopen'd machinery the guard protects, and a static self-contained
-            # binary is the whole point, so replace the error with a no-op. The
-            # isc__initialize fixes below live in this SAME postPatch rather than
-            # a platform attrs set — a `postPatch` there would shadow, not append
-            # to, this one.
-            postPatch = (old.postPatch or "") + ''
-              substituteInPlace configure \
-                --replace-fail 'as_fn_error $? "Static linking is not supported as it disables dlopen() and certain security features (e.g. RELRO, ASLR)"' ': '
-              # Force lib/isc/lib.o — and its isc__initialize constructor — into
-              # every tool's engine module. isc__initialize
-              # (__attribute__((constructor))) sets up mutex attrs, arenas, TLS,
-              # hashing, libisc's OpenSSL digest table and rcu registration, but
-              # nothing references it by symbol, so neither the static linker nor
-              # the fold's llvm-link pulls lib.o and it never runs. macOS aborts at
-              # the first isc_mutex_init ("pthread_mutex_init(): Invalid argument
-              # (22)"), which is why this started as a darwin-only fix. Linux does
-              # not abort — and that is what hid the rest of the damage: with
-              # isc__md_initialize() never called, `isc__md_sha256` and its siblings
-              # stay NULL and every isc_md() returns ISC_R_NOTIMPLEMENTED.
-              # dig/host/nslookup hash nothing at startup and looked healthy, but
-              # delv builds a view first, and dns_view_create's opening move is
-              # isc_file_sanitize() -> isc_md(SHA256): every delv query failed with
-              # ";; resolution failed: not implemented" without a packet leaving the
-              # host. The constructor is needed on every platform. A -u linker flag
-              # can't help — the engine builds each module from the captured object
-              # list via llvm-link, which ignores -u. So plant a real symbol
-              # reference from mem.c (always linked — it owns isc_mem_create); `used`
-              # shields it from opt -internalize.
-              {
-                echo 'void isc__initialize(void);'
-                echo '__attribute__((used)) static void (*const isc__unpin_force_init)(void) = isc__initialize;'
-              } >> lib/isc/mem.c
-              # Register the main thread with liburcu exactly once. That
-              # reference pulls lib.o into all five programs' modules, each of which
-              # internalizes isc__initialize, so the fold's LTO keeps five renamed
-              # copies — the constructor fires five times at startup. Its body MUST
-              # run every time (libisc's globals are internalized per module too, so
-              # each program inits its own mutex/arena/TLS copies), but
-              # rcu_register_thread() acts on the single shared liburcu depArchive,
-              # so calls 2..5 re-register the main thread and trip liburcu's
-              # assertion (urcu.c:486). Guard ONLY the rcu (un)register calls on a
-              # process-global (the environment, immune to per-module symbol
-              # duplication). Verified: bind's own standalone dig, pre-fold, is clean.
-              substituteInPlace lib/isc/lib.c \
-                --replace-fail 'rcu_register_thread();' \
-                  '{ extern char *getenv(const char *); extern int setenv(const char *, const char *, int); if (!getenv("UNPIN_RCU_MAIN")) { setenv("UNPIN_RCU_MAIN", "1", 1); rcu_register_thread(); } }' \
-                --replace-fail 'rcu_unregister_thread();' \
-                  '{ extern char *getenv(const char *); extern int unsetenv(const char *); if (getenv("UNPIN_RCU_MAIN")) { unsetenv("UNPIN_RCU_MAIN"); rcu_unregister_thread(); } }'
-            '';
+            # patches/allow-static-link.patch: bind's configure refuses a
+            # static build. patches/isc-initialize-fold.patch: libisc's
+            # constructor must reach every program in the fold, once.
+            patches = (old.patches or [ ]) ++ [
+              ./patches/allow-static-link.patch
+              ./patches/isc-initialize-fold.patch
+            ];
             # This package used to add `-u malloc` to NIX_LDFLAGS. LLVM's LTO
             # rewrites library calls AFTER lld has finished scanning the archives
             # — libedit's reallocarr() (`realloc(NULL, n)`) becomes a `malloc(n)`

@@ -1,0 +1,20 @@
+bind's configure aborts "Static linking is not supported as it disables
+dlopen() and certain security features" when enable_static != no (unless
+--enable-developer). The DNS client programs use none of the dlopen'd
+machinery the guard protects (named's dyndb/plugins), and a static,
+self-contained binary is the point of this package, so make it a no-op.
+Patches the generated configure: nixpkgs' bind doesn't run autoreconf.
+
+diff --git a/configure b/configure
+index fd20499..a1f1d1e 100755
+--- a/configure
++++ b/configure
+@@ -17745,7 +17745,7 @@ DLOPEN_LIBS="$lt_cv_dlopen_libs"
+ 
+ if test "$enable_static" != "no" && test "$enable_developer" != "yes"
+ then :
+-  as_fn_error $? "Static linking is not supported as it disables dlopen() and certain security features (e.g. RELRO, ASLR)" "$LINENO" 5
++  :  "$LINENO" 5
+ fi
+ 
+ 
