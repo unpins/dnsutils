@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- **`mdig`** is included: it sends many queries over one connection.
+- **GSS-TSIG on Linux:** `nsupdate -g` authenticates dynamic updates with
+  Kerberos. macOS still lacks it.
+
 ## [9.20.29-1] - 2026-09-26
 
 - **`delv` works, and so does TSIG.** libisc sets up its digest table, mutex
