@@ -200,26 +200,6 @@
             # Our installPhase already puts every program in $out/bin.
             postInstall = "";
             postFixup = "";
-          }
-          // pkgs.lib.optionalAttrs isDarwin {
-            # bind compiles its `gen` build helper with BUILD_CC=$(CC_FOR_BUILD).
-            # pkgsStatic makes host≠build, so nixpkgs adds that flag and the
-            # stdenv points CC_FOR_BUILD at the *vanilla* darwin `clang`, whose
-            # wrapper drives the ELF ld.lld and chokes on the Mach-O compiler-rt
-            # ("archive member … neither ET_REL nor LLVM bitcode") — it cannot
-            # link an executable, so bind's build-cc conftest fails. Every darwin
-            # build that ships is native (build == host: x86_64 on macos-13,
-            # arm64 on macos-14), so the host engine cc ($CC — e.g.
-            # x86_64-apple-darwin-clang / arm64-apple-darwin-clang, both linking
-            # via ld64.lld) is also the build cc and compiles/runs `gen` fine; pin
-            # CC_FOR_BUILD to it. ($CC is arch-correct on both runners — hardcoding
-            # x86_64 would break the arm64 runner. The local aarch64-darwin *cross*
-            # check can't get here: bind's `gen` must run on the x86_64 build host,
-            # and the cross build cc is broken, so aarch64-darwin's source of truth
-            # is CI macos-14.) Darwin-gated → Linux bind stays byte-identical.
-            preConfigure = (old.preConfigure or "") + ''
-              export CC_FOR_BUILD=$CC
-            '';
           }));
         in
         bindStatic;
